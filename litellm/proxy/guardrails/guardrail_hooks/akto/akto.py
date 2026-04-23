@@ -1,13 +1,16 @@
 """Akto guardrail integration for LiteLLM proxy.
 
-Mode:
-  - pre_call: Validates request against Akto guardrails, blocks if flagged.
+Modes:
+  - pre_call: Validates the LLM request against Akto guardrails, blocks if flagged.
+    Sends ``guardrails=true`` to Akto with the request payload.
+  - post_call: Validates the LLM response against Akto guardrails, blocks if flagged.
+    Sends ``response_guardrails=true`` to Akto with the response payload.
 """
 
 import json
 import os
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
 
 from fastapi import HTTPException
 
@@ -87,6 +90,7 @@ class AktoGuardrail(CustomGuardrail):
 
         kwargs["supported_event_hooks"] = [
             GuardrailEventHooks.pre_call,
+            GuardrailEventHooks.post_call,
         ]
         super().__init__(**kwargs)
 
@@ -163,6 +167,46 @@ class AktoGuardrail(CustomGuardrail):
         return body
 
     @staticmethod
+    def build_response_body(
+        inputs: GenericGuardrailAPIInputs,
+        request_data: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """Build the LLM response body from guardrail inputs (assistant content, tool_calls).
+
+        Prefers a full serialization of the ModelResponse when available on
+        ``request_data["response"]``; falls back to reconstructing an OpenAI-style
+        response from ``inputs['texts']``.
+        """
+        response_obj = (request_data or {}).get("response")
+        if response_obj is not None:
+            dump = getattr(response_obj, "model_dump", None)
+            if callable(dump):
+                try:
+                    dumped = dump()
+                    if isinstance(dumped, dict):
+                        return dumped
+                except Exception:
+                    pass
+
+        model = inputs.get("model", "") or ""
+        texts: List[str] = list(inputs.get("texts", []) or [])
+        tool_calls = inputs.get("tool_calls")
+
+        choices: List[Dict[str, Any]] = []
+        for text in texts:
+            message: Dict[str, Any] = {"role": "assistant", "content": text}
+            choices.append({"index": len(choices), "message": message, "finish_reason": "stop"})
+        if not choices:
+            message = {"role": "assistant", "content": ""}
+            if tool_calls:
+                message["tool_calls"] = tool_calls  # type: ignore[assignment]
+            choices.append({"index": 0, "message": message, "finish_reason": "stop"})
+        elif tool_calls:
+            choices[0]["message"]["tool_calls"] = tool_calls
+
+        return {"model": model, "choices": choices}
+
+    @staticmethod
     def build_tag_metadata(request_data: dict) -> Dict[str, str]:
         """Build tag/metadata dict with user_id and team_id for Akto tracking."""
         tag: Dict[str, str] = {"gen-ai": "Gen AI"}
@@ -182,16 +226,26 @@ class AktoGuardrail(CustomGuardrail):
         self,
         inputs: GenericGuardrailAPIInputs,
         request_data: dict,
+        input_type: Literal["request", "response"] = "request",
     ) -> Dict[str, Any]:
         """Build the MIRRORING payload for Akto's guardrail validation endpoint.
 
-        Response headers and payload are empty — the guardrail only sends
-        the request for validation, not the response.
+        For ``input_type="request"`` the LLM request is placed in ``requestPayload``
+        and ``responsePayload`` is an empty object. For ``input_type="response"``
+        the LLM response is placed in ``responsePayload`` and ``requestPayload``
+        is an empty object (the request was already validated by the pre_call hook
+        when configured).
         """
         request_path = self.extract_request_path(request_data)
         request_headers = self.build_request_headers(request_data)
-        request_body = self.build_request_body(inputs, request_data)
         tag = self.build_tag_metadata(request_data)
+
+        if input_type == "response":
+            request_body: Dict[str, Any] = {}
+            response_body = self.build_response_body(inputs, request_data)
+        else:
+            request_body = self.build_request_body(inputs, request_data)
+            response_body = {}
 
         # Extract client IP from proxy headers
         ip = ""
@@ -214,7 +268,7 @@ class AktoGuardrail(CustomGuardrail):
             "responseHeaders": json.dumps({}),
             "method": "POST",
             "requestPayload": json.dumps(request_body),
-            "responsePayload": json.dumps({}),
+            "responsePayload": json.dumps(response_body),
             "ip": ip,
             "destIp": "127.0.0.1",
             "time": str(int(datetime.now().timestamp() * 1000)),
@@ -237,12 +291,24 @@ class AktoGuardrail(CustomGuardrail):
 
     # ── HTTP ──
 
-    async def send_to_akto(self, payload: dict) -> httpx.Response:
-        """POST payload to Akto guardrail API for validation."""
+    async def send_to_akto(
+        self,
+        payload: dict,
+        input_type: Literal["request", "response"] = "request",
+    ) -> httpx.Response:
+        """POST payload to Akto guardrail API for validation.
+
+        ``input_type="request"`` sends ``guardrails=true`` so Akto validates the
+        request payload. ``input_type="response"`` sends ``response_guardrails=true``
+        so Akto validates the response payload instead.
+        """
+        flag_key = (
+            "response_guardrails" if input_type == "response" else "guardrails"
+        )
         return await self.async_handler.post(
             url=f"{self.akto_base_url}{HTTP_PROXY_PATH}",
             data=json.dumps(payload),
-            params={"akto_connector": AKTO_CONNECTOR_NAME, "guardrails": "true"},
+            params={"akto_connector": AKTO_CONNECTOR_NAME, flag_key: "true"},
             headers={
                 "content-type": "application/json",
                 "Authorization": self.akto_api_key,
@@ -292,13 +358,10 @@ class AktoGuardrail(CustomGuardrail):
         input_type: Literal["request", "response"],
         logging_obj=None,
     ) -> GenericGuardrailAPIInputs:
-        """Pre_call: validate request against Akto guardrails, block if flagged."""
-        if input_type != "request":
-            return inputs
-
-        payload = self.build_akto_payload(inputs, request_data)
+        """Validate the request (pre_call) or response (post_call) against Akto."""
+        payload = self.build_akto_payload(inputs, request_data, input_type=input_type)
         try:
-            response = await self.send_to_akto(payload)
+            response = await self.send_to_akto(payload, input_type=input_type)
             allowed, reason = self.handle_guardrail_response(response)
         except HTTPException:
             raise

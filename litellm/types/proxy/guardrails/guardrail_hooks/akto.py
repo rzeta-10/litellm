@@ -9,8 +9,11 @@ class AktoConfigModel(GuardrailConfigModel):
     """
     Config for the Akto guardrail.
 
-    Mode:
-      pre_call -> validate request, block if flagged
+    Modes:
+      pre_call  -> validate the LLM request, block if flagged
+      post_call -> validate the LLM response, block if flagged
+
+    Use a list (``mode: [pre_call, post_call]``) to validate both sides.
     """
 
     akto_base_url: Optional[str] = Field(
