@@ -12,7 +12,8 @@ if TYPE_CHECKING:
 def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"):
     import litellm
 
-    # Note: AktoGuardrail only supports pre_call.
+    # Supports pre_call (request validation) and post_call (response validation).
+    # Configure via `mode: pre_call`, `mode: post_call`, or `mode: [pre_call, post_call]`.
     _akto_callback = AktoGuardrail(
         akto_base_url=getattr(litellm_params, "akto_base_url", None),
         akto_api_key=getattr(litellm_params, "akto_api_key", None),

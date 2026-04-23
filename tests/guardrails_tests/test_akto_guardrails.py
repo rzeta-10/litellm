@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from starlette.exceptions import HTTPException
+from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.utils import GenericGuardrailAPIInputs
 from litellm.proxy.guardrails.guardrail_registry import (
     guardrail_initializer_registry,
@@ -494,3 +495,255 @@ def test_build_tag_metadata(akto_validate, sample_request_data):
     assert tag["gen-ai"] == "Gen AI"
     assert tag["user_id"] == "user-1"
     assert tag["team_id"] == "team-1"
+
+
+# ---------------------------------------------------------------------------
+#  Post-call (response guardrails) — configuration
+# ---------------------------------------------------------------------------
+
+
+def test_supported_event_hooks_include_post_call():
+    g = AktoGuardrail(
+        akto_base_url="http://localhost:9090",
+        akto_api_key="tok",
+        guardrail_name="t",
+        event_hook="post_call",
+    )
+    assert GuardrailEventHooks.pre_call in g.supported_event_hooks
+    assert GuardrailEventHooks.post_call in g.supported_event_hooks
+
+
+def test_post_call_mode_runs_on_post_event():
+    g = AktoGuardrail(
+        akto_base_url="http://localhost:9090",
+        akto_api_key="tok",
+        guardrail_name="t",
+        event_hook="post_call",
+        default_on=True,
+    )
+    assert (
+        g.should_run_guardrail(data={}, event_type=GuardrailEventHooks.post_call)
+        is True
+    )
+    assert (
+        g.should_run_guardrail(data={}, event_type=GuardrailEventHooks.pre_call)
+        is False
+    )
+
+
+def test_list_mode_runs_on_both_events():
+    g = AktoGuardrail(
+        akto_base_url="http://localhost:9090",
+        akto_api_key="tok",
+        guardrail_name="t",
+        event_hook=["pre_call", "post_call"],
+        default_on=True,
+    )
+    assert (
+        g.should_run_guardrail(data={}, event_type=GuardrailEventHooks.pre_call)
+        is True
+    )
+    assert (
+        g.should_run_guardrail(data={}, event_type=GuardrailEventHooks.post_call)
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Post-call — payload construction
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def akto_response():
+    """AktoGuardrail configured for post_call (response validation)."""
+    return AktoGuardrail(
+        akto_base_url="http://localhost:9090",
+        akto_api_key="test-token",
+        unreachable_fallback="fail_closed",
+        guardrail_name="test-akto-response",
+        event_hook="post_call",
+    )
+
+
+@pytest.fixture
+def sample_response_inputs() -> GenericGuardrailAPIInputs:
+    """Inputs as produced by the response-side translation handler."""
+    return GenericGuardrailAPIInputs(
+        texts=["The answer is 42."],
+        model="gpt-4",
+    )
+
+
+@pytest.fixture
+def sample_response_request_data() -> dict:
+    """request_data as built by OpenAIChatCompletionsHandler.process_output_response."""
+    mock_response = MagicMock()
+    mock_response.model = "gpt-4"
+    mock_response.model_dump.return_value = {
+        "model": "gpt-4",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "The answer is 42."},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    return {
+        "response": mock_response,
+        "litellm_metadata": {
+            "user_api_key_user_id": "user-1",
+            "user_api_key_team_id": "team-1",
+        },
+    }
+
+
+def test_build_response_body_from_model_dump(sample_response_inputs, sample_response_request_data):
+    body = AktoGuardrail.build_response_body(
+        sample_response_inputs, sample_response_request_data
+    )
+    assert body["model"] == "gpt-4"
+    assert body["choices"][0]["message"]["content"] == "The answer is 42."
+
+
+def test_build_response_body_fallback_to_texts():
+    inputs = GenericGuardrailAPIInputs(texts=["hello"], model="gpt-4")
+    body = AktoGuardrail.build_response_body(inputs, {})
+    assert body["model"] == "gpt-4"
+    assert body["choices"][0]["message"]["role"] == "assistant"
+    assert body["choices"][0]["message"]["content"] == "hello"
+
+
+def test_build_response_body_empty_texts_no_crash():
+    inputs = GenericGuardrailAPIInputs(texts=[], model="gpt-4")
+    body = AktoGuardrail.build_response_body(inputs, None)
+    assert body["model"] == "gpt-4"
+    assert body["choices"][0]["message"]["content"] == ""
+
+
+def test_build_akto_payload_response_mode_populates_response_payload(
+    akto_response, sample_response_inputs, sample_response_request_data
+):
+    payload = akto_response.build_akto_payload(
+        sample_response_inputs,
+        sample_response_request_data,
+        input_type="response",
+    )
+    # requestPayload is empty in response mode (the request was validated pre_call)
+    assert payload["requestPayload"] == json.dumps({})
+    # responsePayload holds the LLM response
+    resp_body = json.loads(payload["responsePayload"])
+    assert resp_body["model"] == "gpt-4"
+    assert resp_body["choices"][0]["message"]["content"] == "The answer is 42."
+
+
+def test_build_akto_payload_defaults_to_request_mode(
+    akto_validate, sample_inputs, sample_request_data
+):
+    # No input_type arg → behaves like before (request mode).
+    payload = akto_validate.build_akto_payload(sample_inputs, sample_request_data)
+    assert payload["responsePayload"] == json.dumps({})
+    req_body = json.loads(payload["requestPayload"])
+    assert req_body["messages"][0]["content"] == "Hello, how are you?"
+
+
+# ---------------------------------------------------------------------------
+#  Post-call — apply_guardrail behavior
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_call_allowed(akto_response, sample_response_inputs, sample_response_request_data):
+    akto_response.async_handler.post = AsyncMock(return_value=_mock_allowed_response())
+
+    result = await akto_response.apply_guardrail(
+        inputs=sample_response_inputs,
+        request_data=sample_response_request_data,
+        input_type="response",
+    )
+
+    assert result == sample_response_inputs
+    akto_response.async_handler.post.assert_called_once()
+    params = akto_response.async_handler.post.call_args.kwargs["params"]
+    # Post-call uses `response_guardrails=true`, NOT `guardrails=true`
+    assert params.get("response_guardrails") == "true"
+    assert "guardrails" not in params
+    assert "ingest_data" not in params
+
+
+@pytest.mark.asyncio
+async def test_post_call_blocked(akto_response, sample_response_inputs, sample_response_request_data):
+    akto_response.async_handler.post = AsyncMock(
+        return_value=_mock_blocked_response("Leaked PII in response")
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await akto_response.apply_guardrail(
+            inputs=sample_response_inputs,
+            request_data=sample_response_request_data,
+            input_type="response",
+        )
+
+    assert exc_info.value.status_code == 403
+    assert "Leaked PII in response" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_post_call_sends_response_payload_not_request_payload(
+    akto_response, sample_response_inputs, sample_response_request_data
+):
+    akto_response.async_handler.post = AsyncMock(return_value=_mock_allowed_response())
+
+    await akto_response.apply_guardrail(
+        inputs=sample_response_inputs,
+        request_data=sample_response_request_data,
+        input_type="response",
+    )
+
+    sent_body = json.loads(akto_response.async_handler.post.call_args.kwargs["data"])
+    assert sent_body["requestPayload"] == json.dumps({})
+    assert json.loads(sent_body["responsePayload"])["choices"][0]["message"]["content"] == (
+        "The answer is 42."
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_call_fail_open_on_unreachable():
+    g = AktoGuardrail(
+        akto_base_url="http://localhost:9090",
+        akto_api_key="test-token",
+        unreachable_fallback="fail_open",
+        guardrail_name="post-fail-open",
+        event_hook="post_call",
+    )
+    g.async_handler.post = AsyncMock(
+        side_effect=httpx.ConnectError("Connection refused")
+    )
+
+    inputs = GenericGuardrailAPIInputs(texts=["hi"], model="gpt-4")
+    result = await g.apply_guardrail(
+        inputs=inputs, request_data={}, input_type="response"
+    )
+    assert result.get("texts") == ["hi"]
+
+
+@pytest.mark.asyncio
+async def test_post_call_fail_closed_on_unreachable():
+    g = AktoGuardrail(
+        akto_base_url="http://localhost:9090",
+        akto_api_key="test-token",
+        unreachable_fallback="fail_closed",
+        guardrail_name="post-fail-closed",
+        event_hook="post_call",
+    )
+    g.async_handler.post = AsyncMock(
+        side_effect=httpx.ConnectError("Connection refused")
+    )
+
+    inputs = GenericGuardrailAPIInputs(texts=["hi"], model="gpt-4")
+    with pytest.raises(HTTPException) as exc_info:
+        await g.apply_guardrail(
+            inputs=inputs, request_data={}, input_type="response"
+        )
+    assert exc_info.value.status_code == 503
